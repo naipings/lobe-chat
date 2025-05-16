@@ -1,6 +1,7 @@
 import { ElectronIPCEventHandler, ElectronIPCServer } from '@lobechat/electron-server-ipc';
 import { Session, app, ipcMain, protocol } from 'electron';
 import { macOS, windows } from 'electron-is';
+import os from 'node:os';
 import { join } from 'node:path';
 
 import { name } from '@/../../package.json';
@@ -8,6 +9,7 @@ import { buildDir, nextStandaloneDir } from '@/const/dir';
 import { isDev } from '@/const/env';
 import { IControlModule } from '@/controllers';
 import { IServiceModule } from '@/services';
+import { IpcClientEventSender } from '@/types/ipcClientEvent';
 import { createLogger } from '@/utils/logger';
 import { CustomRequestHandler, createHandler } from '@/utils/next-electron-rsc';
 
@@ -17,6 +19,7 @@ import { IoCContainer } from './IoCContainer';
 import MenuManager from './MenuManager';
 import { ShortcutManager } from './ShortcutManager';
 import { StoreManager } from './StoreManager';
+import TrayManager from './TrayManager';
 import { UpdaterManager } from './UpdaterManager';
 
 const logger = createLogger('core:App');
@@ -37,6 +40,8 @@ export class App {
   storeManager: StoreManager;
   updaterManager: UpdaterManager;
   shortcutManager: ShortcutManager;
+  trayManager: TrayManager;
+  chromeFlags: string[] = ['OverlayScrollbar', 'FluentOverlayScrollbar', 'FluentScrollbar'];
 
   /**
    * whether app is in quiting
@@ -54,6 +59,13 @@ export class App {
   }
 
   constructor() {
+    logger.info('----------------------------------------------');
+    // Log system information
+    logger.info(`  OS: ${os.platform()} (${os.arch()})`);
+    logger.info(` CPU: ${os.cpus().length} cores`);
+    logger.info(` RAM: ${Math.round(os.totalmem() / 1024 / 1024 / 1024)} GB`);
+    logger.info(`PATH: ${app.getAppPath()}`);
+    logger.info(` lng: ${app.getLocale()}`);
     logger.info('----------------------------------------------');
     logger.info('Starting LobeHub...');
 
@@ -84,6 +96,7 @@ export class App {
     this.menuManager = new MenuManager(this);
     this.updaterManager = new UpdaterManager(this);
     this.shortcutManager = new ShortcutManager(this);
+    this.trayManager = new TrayManager(this);
 
     // register the schema to interceptor url
     // it should register before app ready
@@ -121,6 +134,11 @@ export class App {
     this.shortcutManager.initialize();
 
     this.browserManager.initializeBrowsers();
+
+    // Initialize tray manager
+    if (process.platform === 'win32') {
+      this.trayManager.initializeTrays();
+    }
 
     // Initialize updater manager
     await this.updaterManager.initialize();
@@ -167,6 +185,8 @@ export class App {
         }
       }
     });
+
+    app.commandLine.appendSwitch('enable-features', this.chromeFlags.join(','));
 
     logger.debug('Waiting for app to be ready');
     await app.whenReady();
@@ -332,9 +352,13 @@ export class App {
     this.ipcClientEventMap.forEach((eventInfo, key) => {
       const { controller, methodName } = eventInfo;
 
-      ipcMain.handle(key, async (e, ...data) => {
+      ipcMain.handle(key, async (e, data) => {
+        // 从 WebContents 获取对应的 BrowserWindow id
+        const senderIdentifier = this.browserManager.getIdentifierByWebContents(e.sender);
         try {
-          return await controller[methodName](...data);
+          return await controller[methodName](data, {
+            identifier: senderIdentifier,
+          } as IpcClientEventSender);
         } catch (error) {
           logger.error(`Error handling IPC event ${key}:`, error);
           return { error: error.message };
@@ -362,7 +386,13 @@ export class App {
 
   // 新增 before-quit 处理函数
   private handleBeforeQuit = () => {
-    this.isQuiting = true; // 首先设置标志
+    logger.info('Application is preparing to quit');
+    this.isQuiting = true;
+
+    // 销毁托盘
+    if (process.platform === 'win32') {
+      this.trayManager.destroyAll();
+    }
 
     // 执行清理操作
     this.unregisterAllRequestHandlers();
